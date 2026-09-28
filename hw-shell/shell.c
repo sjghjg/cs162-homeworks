@@ -43,7 +43,7 @@ typedef struct fun_desc {
 
 fun_desc_t cmd_table[] = {
     {cmd_help, "?", "show this help menu"},
-    {cmd_exit, "exit", "exit the command shell"},
+    {cmd_exit, "exit", "exit the command shell"}
 };
 
 /* Prints a helpful description for the given command */
@@ -55,6 +55,225 @@ int cmd_help(unused struct tokens* tokens) {
 
 /* Exits this shell */
 int cmd_exit(unused struct tokens* tokens) { exit(0); }
+
+char* resolve_path(char* cmd){
+    /* If command already contains a path, use it directly. */
+  if (strchr(cmd, '/') != NULL) {
+    if (access(cmd, X_OK) == 0) {
+      return strdup(cmd);
+    }
+    return NULL;
+  }
+
+  char* path_env = getenv("PATH");
+  if (!path_env)return NULL;
+  char* path_cpy = strdup(path_env);
+  char* saveptr;
+  char* dir = strtok_r(path_cpy, ":", &saveptr);
+  char full_path[1024];
+
+  while(dir != NULL){
+    snprintf(full_path, sizeof(full_path), "%s/%s", dir, cmd);
+    if (access(full_path, X_OK) == 0){
+      free(path_cpy);
+      return strdup(full_path);
+    }
+    dir = strtok_r(NULL, ":", &saveptr);
+  }
+  free(path_cpy);
+  return NULL;
+}
+
+
+
+void run_program(struct tokens* tokens){
+  size_t num_tokens = tokens_get_length(tokens);
+  int len_pipe_arr = 0;
+
+  /* malloc cmds, cmds[len_pipe_arr+1][] */
+  for (size_t i = 0; i < num_tokens; i++){
+    char* token = tokens_get_token(tokens, i);
+    if(strcmp(token, "|") == 0){
+      len_pipe_arr++; 
+    } 
+  } 
+  int num_childp = len_pipe_arr +1;
+  char*** cmds = malloc((num_childp+1) * sizeof(char**)); 
+  if (cmds == NULL){
+    free(cmds);
+    perror("malloc cmds failed");
+    exit(1);
+  }
+  cmds[num_childp] = NULL;
+
+  /* malloc argv, cmds[][argv] */
+  char** argv = malloc((num_tokens +1) * sizeof(char*));  
+  char** input_files = calloc(num_childp, sizeof(char*));
+  char** output_files = calloc(num_childp, sizeof(char*));
+  size_t argc = 0;
+  int count_len_pipe_arr = 0;
+  for (size_t i = 0; i < num_tokens; i++){
+    /*check '<' and '>' for each token */
+    char* token = tokens_get_token(tokens, i);
+    if (strcmp(token, "<") == 0){
+      if (i+1 < num_tokens){
+        input_files[count_len_pipe_arr] = tokens_get_token(tokens, i+1);
+        i++;
+      }
+    }else if(strcmp(token, ">") == 0){
+      if (i+1 < num_tokens){
+        output_files[count_len_pipe_arr] = tokens_get_token(tokens, i+1);
+        i++; 
+      }
+    }else if(strcmp(token, "|") == 0){
+      if (i+1 < num_tokens){
+        argv[argc] = NULL;
+        argc = 0;
+        cmds[count_len_pipe_arr] =  argv;
+        argv = malloc((num_tokens +1) * sizeof(char*));   
+        if (argv == NULL){
+          for (int j = 0; j < count_len_pipe_arr; j++){
+            free(cmds[j]);
+            free(cmds);
+            perror(" malloc argv failed");
+            exit(1);
+          }
+        } 
+        count_len_pipe_arr++;
+      }
+    }else{
+      argv[argc] = token;
+      argc++;      
+    }    
+  }
+  argv[argc] = NULL;
+  cmds[num_childp-1] = argv;
+
+  /* create pipe*/
+  int pipe_arr[len_pipe_arr][2];
+  for (int i = 0; i < len_pipe_arr; i++){
+    if (pipe(pipe_arr[i]) < 0){
+      perror("pipe failed");
+      exit(1);
+    }
+  }
+  /* get shell process group*/
+  pid_t shellpgrp = getpgrp();
+
+  /* ignore signal from keyboarb shortcut*/
+  signal(SIGINT, SIG_IGN);
+  signal(SIGTSTP, SIG_IGN);
+  signal(SIGTTIN, SIG_IGN);
+  signal(SIGTTOU, SIG_IGN);
+
+  /* create child process*/ 
+  for (int i = 0; i < num_childp; i++){
+    pid_t pid = fork();  
+
+    /* child process */
+    if (pid == 0){
+      pid_t cpgrp = getpgrp();
+
+      if (i == 0){
+        setpgrp();
+      }else{
+        setpgid(0, cpgrp);
+      }
+      tcsetpgrp(0, cpgrp);
+
+      signal(SIGINT, SIG_DFL);   // Ctrl+C
+      signal(SIGQUIT, SIG_DFL);  /*  Ctrl+\ */
+      signal(SIGTSTP, SIG_DFL);  // Ctrl+Z
+      signal(SIGTTIN, SIG_DFL);  // Background read from tty
+      signal(SIGTTOU, SIG_DFL);  // Background write to tty
+
+      char* cmd= cmds[i][0];
+      /* path resolution*/
+      char* path = resolve_path(cmd);
+      if (path == NULL) {
+        fprintf(stderr, "%s: command not found\n", cmd);
+        free(path);
+        for (int j = 0; j < len_pipe_arr; j++){
+          free(cmds[j]);
+        }
+        free(cmds);
+        exit(1);
+      }
+
+      /* first child process no need changes its STDIN*/
+      if (i > 0){
+        dup2(pipe_arr[i-1][0], STDIN_FILENO);        
+      }
+
+      /* last child process no need changes its STDOUT*/
+      if (i < len_pipe_arr){
+        dup2(pipe_arr[i][1], STDOUT_FILENO);      
+      }
+
+      /* close pipe*/
+      for (int j = 0; j < len_pipe_arr; j++){
+        close(pipe_arr[j][0]);
+        close(pipe_arr[j][1]);
+      }
+
+      /* redirection */
+      /* check "<" */
+      if (input_files[i] != NULL){
+        int in_fd = open(input_files[i], O_RDONLY);
+        if (in_fd < 0){
+          perror("open input file failed");
+          exit(1);
+        }
+        dup2(in_fd, STDIN_FILENO);
+        close(in_fd);
+      }
+
+      /* check ">" */
+      if(output_files[i] != NULL){
+        int out_fd = open(output_files[i], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out_fd < 0){
+          perror("open output file failed");
+          exit(1);
+        }
+        dup2(out_fd, STDOUT_FILENO);
+        close(out_fd);
+      }
+      /* program execution */
+      execv(path, cmds[i]);
+
+      perror("execv failed");
+      free(path);
+      exit(1);
+      }else if(pid < 0){
+        perror("fork failed");
+        for (int j = 0; j < len_pipe_arr; j++){
+          free(cmds[j]);
+        }
+        free(cmds);
+        return;
+      }
+
+      for (int j = 0; j < len_pipe_arr; j++){
+        close(pipe_arr[j][0]);
+        close(pipe_arr[j][1]);
+      }
+      
+      for (int j = 0; j < num_childp; j++){
+        int status;
+        wait(&status);
+      }
+
+      /* push the pidgrp to the foreground to accept new terminal input*/
+      tcsetpgrp(0, shellpgrp);
+
+      for (int j = 0; j < num_childp; j++){
+        free(cmds[j]);
+      }
+      free(cmds);
+      free(input_files);
+      free(output_files);      
+  }
+  }
 
 /* Looks up the built-in command, if it exists. */
 int lookup(char cmd[]) {
@@ -110,8 +329,7 @@ int main(unused int argc, unused char* argv[]) {
     if (fundex >= 0) {
       cmd_table[fundex].fun(tokens);
     } else {
-      /* REPLACE this to run commands as programs. */
-      fprintf(stdout, "This shell doesn't know how to run programs.\n");
+      run_program(tokens);
     }
 
     if (shell_is_interactive)
